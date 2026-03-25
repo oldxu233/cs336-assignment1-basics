@@ -5,6 +5,9 @@ from multiprocessing import Pool
 import regex as re
 import time
 import heapq
+import logging
+logger = logging.getLogger(__name__)
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 # pytest -v tests/test_train_bpe.py
 
 def bytes_to_escaped(b: bytes) -> str:
@@ -72,61 +75,11 @@ def save_bpe_model(vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], v
     return vocab_file, merges_file
 
 
-def find_chunk_boundaries(
-    file: BinaryIO,
-    desired_num_chunks: int,
-    split_special_token: bytes,
-) -> list[int]:
-    """
-    将文件分块，每个块可以独立计数。
-    如果边界最终重叠，可能返回少于期望数量的块。
-    """
-    assert isinstance(split_special_token, bytes), "特殊令牌必须表示为字节字符串"
-
-    # 获取文件总大小（字节）
-    file.seek(0, os.SEEK_END)  # 移动到文件末尾
-    file_size = file.tell()    # 获取当前位置（即文件大小）
-    file.seek(0)               # 回到文件开头
-
-    chunk_size = file_size // desired_num_chunks  # 计算每个块的期望大小
-
-    # 初始猜测的块边界位置，均匀分布
-    # 块从前一个索引开始，不包含最后一个索引
-    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
-    chunk_boundaries[-1] = file_size  # 最后一个边界设为文件大小
-
-    mini_chunk_size = 4096 * 2560  # 每次向前读取4KB * 2560 = 10240KB 字节
-
-    # 调整边界，使其落在特殊令牌之后
-    for bi in range(1, len(chunk_boundaries) - 1):
-        initial_position = chunk_boundaries[bi]  # 初始边界位置
-        file.seek(initial_position)  # 移动到边界猜测位置
-        while True:
-            mini_chunk = file.read(mini_chunk_size)  # 读取一个小块
-
-            # 如果到达文件末尾，将此边界设为文件末尾
-            if mini_chunk == b"":
-                chunk_boundaries[bi] = file_size
-                break
-
-            # 在小块中查找特殊令牌
-            found_at = mini_chunk.find(split_special_token)
-            if found_at != -1:  # 如果找到特殊令牌
-                # 将边界设置在特殊令牌之后的位置
-                chunk_boundaries[bi] = initial_position + found_at + len(split_special_token)
-                break
-            initial_position += mini_chunk_size  # 没找到，继续向前搜索
-
-    # 确保所有边界都是唯一的，但可能少于期望的块数
-    return sorted(set(chunk_boundaries))
-
-
-
 # 预分词
 GPT2_PATTERN = None
 SPECIAL_TOKEN_PATTERN = None
 def init_worker(special_tokens):
-    global GPT2_PATTERN, SPECIAL_TOKEN_PATTERN, SPECIAL_TOKENS_SET
+    global GPT2_PATTERN, SPECIAL_TOKEN_PATTERN
     SPECIAL_TOKEN_PATTERN = re.compile("|".join(map(re.escape, special_tokens)))
     
     GPT2_PATTERN_STR = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -149,6 +102,16 @@ def count_one_chunk_(args):
 Stats = Dict[Tuple[int, int], int]
 WordDict = Dict[Tuple[int, ...], int]
 def init_word_dict(token_freqs: Dict[str, int]):
+    """
+    总时间复杂度: 3*O(T) = O(T)
+    设: 
+        - N = 不同 token 的数量
+        - L = 平均 token 长度（字节数）
+        - T = 所有 token 的总字节数 = O(N * L)
+    构建 word2freq	    O(T)	遍历所有 token 并UTF-8 编码
+    构建 pair2freq	    O(T)	每个词扫一遍找相邻 pair
+    构建 pair_to_words	O(T)	同样扫描所有 pair
+    """
     word2freq: WordDict = {}
     pair2freq: Stats = defaultdict(int)
     for tok, f in token_freqs.items():
@@ -164,9 +127,35 @@ def init_word_dict(token_freqs: Dict[str, int]):
     for seq in word2freq:
         for a, b in zip(seq, seq[1:]):
             pair_to_words[(a, b)].add(seq)
+    """
+    pair_to_words = {
+        (115, 104): {(115, 104, 101)},                    # "sh" 只在 "she" 中
+        (104, 101): {(115, 104, 101), (116, 104, 101), (104, 101, 108, 108, 111)},  # "he" 在三个词中
+        (116, 104): {(116, 104, 101)},                    # "th" 只在 "the" 中
+        (101, 108): {(104, 101, 108, 108, 111)},          # "el" 只在 "hello" 中
+        (108, 108): {(104, 101, 108, 108, 111)},          # "ll" 只在 "hello" 中
+        (108, 111): {(104, 101, 108, 108, 111)},          # "lo" 只在 "hello" 中
+    }
+    """
     return word2freq, pair2freq, pair_to_words
 
+
+# 单次合并
 def merge_one(pair: Tuple[int, int], word2freq: WordDict, pair2freq: Stats, new_id: int, pair_to_words):
+    """
+    总时间复杂度 = O(k*m)
+    设:
+        - k = 包含该 pair 的词数量 = len(pair_to_words[pair])
+        - m = 这些词的平均长度
+    获取待处理序列   O(k)   list(pair_to_words[pair])
+    扫描找合并位置   O(m)   while 循环遍历
+    构建新序列       O(m)   最坏情况复制所有字节
+    删除旧 pair_to_words关联  O(m)
+    添加新 pair_to_words关联  O(m)
+    更新word2freq            O(m)
+    更新pair2freq, 移除旧pair, 添加新pair 2*O(m)
+    """
+    
     left, right = pair
     seqs_to_process = list(pair_to_words[pair])
     for old_seq in seqs_to_process:
@@ -178,7 +167,7 @@ def merge_one(pair: Tuple[int, int], word2freq: WordDict, pair2freq: Stats, new_
         n = len(old_seq)
         changed = False
         while i < n:
-            if i+1<n and old_seq[i] == left and old_seq[i+1] == right:
+            if i + 1 < n and old_seq[i] == left and old_seq[i + 1] == right:
                 new_seq.append(new_id)
                 i += 2
                 changed = True
@@ -214,7 +203,7 @@ def merge_one(pair: Tuple[int, int], word2freq: WordDict, pair2freq: Stats, new_
             pair2freq[(a, b)] += freq
 
 
-def fast_bpe_loop(token_freqs, vocab, num_merges):
+def fast_bpe_loop(token_freqs, vocab: dict[int, bytes], num_merges: int):
     word2freq, pair2freq, pair2words = init_word_dict(token_freqs)
     merges = []
     next_id = max(vocab.keys()) + 1
@@ -235,11 +224,43 @@ def fast_bpe_loop(token_freqs, vocab, num_merges):
 
         def merge_key(p):
             return (pair2freq[p], vocab[p[0]], vocab[p[1]])
-
+            
         best_pair = max(pair2freq, key=merge_key)
+        """
+        pair2freq = {
+            (97, 98): 100,   # 'a','b' 出现100次
+            (98, 99): 100,   # 'b','c' 出现100次
+            (99, 100): 50,   # 'c','d' 出现50次
+        }
+        vocab = {
+            0: b'\x00',
+            1: b'\x01',
+            # ...
+            65: b'A',
+            97: b'a',
+            98: b'b',
+            99: b'c',
+            # ...
+            255: b'\xff'
+        }
+        vocab[97] = b'a'
+        
+        def merge_key(p):
+            return (pair2freq[p], vocab[p[0]], vocab[p[1]])
+
+        # 计算每个对的比较键
+        merge_key((97,98)) = (100, 1, 2)
+        merge_key((98,99)) = (100, 2, 3)
+        merge_key((99,100)) = (50, 3, 4)
+
+        # 比较过程：
+        # (100,1,2) vs (100,2,3) → 第一个元素相等(100)，比较第二个：1 < 2
+        # 所以 (100,1,2) < (100,2,3)
+        # 因此 max() 会选 (98,99) 因为 (100,2,3) 更大
+        """
         best_freq = pair2freq[best_pair]
         if best_freq == 0:
-            print(f"[BPE] 最佳pair频率为0，在第 {i} 次 merge 停止")
+            print(f"[BPE] 最佳pair频率为0. 在第 {i} 次 merge 停止")
             break
 
         # 构造新 token
@@ -284,7 +305,7 @@ def train_bpe(input_path, vocab_size, special_tokens: list[str]):
     t0 = time.time()
     
     # 初始化vocab
-    vocab = {i: bytes([i]) for i in range(256)}
+    vocab = {i: bytes([i]) for i in range(256)} # dict[int, bytes]
     next_id = 256
     for token in special_tokens:
         token_bytes = token.encode("utf-8")
@@ -304,6 +325,14 @@ def train_bpe(input_path, vocab_size, special_tokens: list[str]):
     t_parallel_start = time.time()
     with Pool(num_processes, initializer=init_worker, initargs=(special_tokens,)) as p:
         results = p.map(count_one_chunk_, tasks)
+    """
+    results = [
+        Counter({"the": 100, "she": 50, ...}),  # 第1个块的统计
+        Counter({"the": 80, "she": 30, ...}),   # 第2个块的统计
+        Counter({"the": 120, "she": 40, ...}),  # 第3个块的统计
+        # ...
+    ]
+    """
     t_parallel = time.time() - t_parallel_start
 
     t_merge_start = time.time()
@@ -340,7 +369,7 @@ def train_bpe(input_path, vocab_size, special_tokens: list[str]):
 def test01():
     special_tokens = ["<|endoftext|>"]
     model_prefix="bpe"
-    # vocab, merges = train_bpe("data/TinyStoriesV2-GPT4-valid.txt", 270, special_tokens)
+    # vocab, merges = train_bpe("data/TinyStoriesV2-GPT4-valid.txt", 500, special_tokens)
     # print(f"vocab具体是： {vocab}, \n merges具体是：{merges}")
     
     vocab, merges = train_bpe("data/TinyStoriesV2-GPT4-train.txt", 10000, special_tokens)
@@ -353,127 +382,6 @@ def test01():
     # merges_file_ = f"./OpenWebText_bpe_results/{model_prefix}.merges"
     # save_bpe_model(vocab, merges, vocab_file=vocab_file_, merges_file=merges_file_)
 
-"""[BPE] 初始 pair2freq 大小: 2108
-[BPE] merge #1000: 最近 1000 次平均耗时 = 0.004981 秒; 当前 pair2freq 大小 = 23860
-[BPE] merge #2000: 最近 1000 次平均耗时 = 0.006334 秒; 当前 pair2freq 大小 = 32216
-[BPE] merge #3000: 最近 1000 次平均耗时 = 0.007671 秒; 当前 pair2freq 大小 = 36765
-[BPE] merge #4000: 最近 1000 次平均耗时 = 0.008062 秒; 当前 pair2freq 大小 = 39011
-[BPE] merge #5000: 最近 1000 次平均耗时 = 0.008578 秒; 当前 pair2freq 大小 = 41152
-[BPE] merge #6000: 最近 1000 次平均耗时 = 0.009102 秒; 当前 pair2freq 大小 = 43084
-[BPE] merge #7000: 最近 1000 次平均耗时 = 0.009431 秒; 当前 pair2freq 大小 = 44621
-[BPE] merge #8000: 最近 1000 次平均耗时 = 0.009759 秒; 当前 pair2freq 大小 = 45759
-[BPE] merge #9000: 最近 1000 次平均耗时 = 0.010034 秒; 当前 pair2freq 大小 = 46739
-[BPE] 总共执行 merge 次数: 9743, 单次平均耗时 = 0.008370 秒
-总耗时: 201.2589 秒
-读文件总耗时: 119.4693 秒
-  - 文件分块: 0.0186 秒
-  - 并行处理: 119.4226 秒
-  - 结果合并: 0.0280 秒
-  BPE 循环耗时: 81.7896 秒
-  合并次数: 9743
-  最终词表大小: 10000
-词表已保存到: ./TinyStories_bpe_results/bpe.vocab
-合并规则已保存到: ./TinyStories_bpe_results/bpe.merges"""
-
-
-
-def update_data_structures(old_seq, new_seq, freq, word2freq, pair2freq, pair2words):
-    """批量更新数据结构（版本稍作防御性修改）"""
-    # 移除旧序列对应的所有 pair 统计
-    for a, b in zip(old_seq, old_seq[1:]):
-        key = (a, b)
-        if key in pair2freq:
-            pair2words[key].discard(old_seq)
-            pair2freq[key] -= freq
-            if pair2freq[key] <= 0:
-                del pair2freq[key]
-            if not pair2words[key]:
-                del pair2words[key]
-
-    # 删除旧序列频率
-    word2freq.pop(old_seq, None)
-
-    # 添加新序列
-    word2freq[new_seq] = word2freq.get(new_seq, 0) + freq
-    for a, b in zip(new_seq, new_seq[1:]):
-        key = (a, b)
-        pair2words[key].add(new_seq)
-        pair2freq[key] = pair2freq.get(key, 0) + freq
-
-
-def fast_bpe_loop_optimized(token_freqs, vocab, num_merges):
-    word2freq, pair2freq, pair2words = init_word_dict(token_freqs)
-    merges = []
-    next_id = max(vocab.keys()) + 1
-
-    # 初始化堆: (-freq, vocab[left], vocab[right], pair)
-    heap = []
-    for (left_id, right_id), freq in pair2freq.items():
-        heapq.heappush(heap, (-freq, vocab[left_id], vocab[right_id], (left_id, right_id)))
-
-    for i in range(num_merges):
-        if not heap:
-            break
-
-        # 弹出有效pair
-        while heap:
-            neg_freq, _, _, best_pair = heapq.heappop(heap)
-            current_freq = -neg_freq
-            if best_pair in pair2freq and pair2freq[best_pair] == current_freq:
-                break
-        else:
-            break
-
-        if current_freq == 0:
-            break
-
-        left_id, right_id = best_pair
-        # 创建新token
-        new_bytes = vocab[left_id] + vocab[right_id]
-        vocab[next_id] = new_bytes
-        merges.append((vocab[left_id], vocab[right_id]))
-
-        # 处理受影响的序列
-        affected_seqs = list(pair2words[best_pair])
-        for old_seq in affected_seqs:
-            if old_seq not in word2freq:
-                continue
-            freq = word2freq[old_seq]
-
-            # 生成新序列
-            new_seq, changed = [], False
-            j, n = 0, len(old_seq)
-            while j < n:
-                if j + 1 < n and old_seq[j] == left_id and old_seq[j + 1] == right_id:
-                    new_seq.append(next_id)
-                    j += 2
-                    changed = True
-                else:
-                    new_seq.append(old_seq[j])
-                    j += 1
-            if not changed:
-                continue
-
-            new_seq_t = tuple(new_seq)
-            update_data_structures(
-                old_seq, new_seq_t, freq,
-                word2freq, pair2freq, pair2words
-            )
-
-            # 将新序列产生的新pair加入堆
-            for a, b in zip(new_seq_t, new_seq_t[1:]):
-                key = (a, b)
-                if key not in pair2freq:  # 可能已被移除
-                    continue
-                # 🔑 修复：用 a, b 而不是 left_id, right_id
-                heapq.heappush(
-                    heap,
-                    (-pair2freq[key], vocab[a], vocab[b], key)
-                )
-        
-        next_id += 1
-
-    return vocab, merges
 
 if __name__ == "__main__":
     test01()
